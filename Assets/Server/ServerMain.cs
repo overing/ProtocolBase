@@ -20,9 +20,15 @@ public sealed class ServerMain : MonoBehaviour
     [SerializeField]
     string _apiBaseUrl = "http://127.0.0.1:18763/pbapi/";
 
+    [SerializeField]
+    string[] _allowOrigins =
+    {
+        "http://127.0.0.1"
+    };
+
     void OnEnable()
     {
-        _server = new(_apiBaseUrl);
+        _server = new(_apiBaseUrl, _allowOrigins);
         _server.Start();
     }
 
@@ -36,16 +42,16 @@ public sealed class ServerMain : MonoBehaviour
 public sealed class ProtocolServer : IDisposable
 {
     HttpListener _httpListener;
-
     Dictionary<string, Func<string, IPEndPoint, ValueTask<string>>> _handlers;
-
+    IReadOnlyCollection<string> _allowOrigins;
     bool _disposed;
 
-    public ProtocolServer(string apiBaseUrl)
+    public ProtocolServer(string apiBaseUrl, IReadOnlyCollection<string> allowOrigins)
     {
         _handlers = ProtocolCallbackUtility.BuildHandlers(target: this);
         _httpListener = new();
         _httpListener.Prefixes.Add(apiBaseUrl); // 用 localhsot 會導致 UnityWebRequest 連不到
+        _allowOrigins = new HashSet<string>(allowOrigins);
     }
 
     async ValueTask<M2C_PlayerLogin> Handle(C2M_PlayerLogin request, IPEndPoint endPoint)
@@ -83,33 +89,37 @@ public sealed class ProtocolServer : IDisposable
     async ValueTask ServeAsync()
     {
         Debug.LogFormat("Server start: {0}", string.Join(Environment.NewLine, _httpListener.Prefixes));
+        Application.runInBackground = true;
         try
         {
             while (_httpListener.IsListening)
             {
                 var context = await _httpListener.GetContextAsync();
+                var (request, response) = (context.Request, context.Response);
 
-                var path = context.Request.Url.LocalPath.Split("/").Last();
+                var origin = request.Headers.GetValues("Origin")?.FirstOrDefault();
+
+                if (!string.IsNullOrWhiteSpace(origin) && _allowOrigins.Contains(origin))
+                    response.AddHeader("Access-Control-Allow-Origin", origin);
+
+                var path = request.Url.LocalPath.Split("/").Last();
                 if (_handlers.TryGetValue(path, out var handler))
                 {
-                    using var reader = new StreamReader(context.Request.InputStream);
+                    using var reader = new StreamReader(request.InputStream);
                     var content = await reader.ReadToEndAsync();
                     var receiveJson = Uri.UnescapeDataString(content);
-                    var sendJson = await handler(receiveJson, context.Request.RemoteEndPoint);
+                    var sendJson = await handler(receiveJson, request.RemoteEndPoint);
 
-                    context.Response.AddHeader("Access-Control-Allow-Headers", "Content-Type, Accept, X-Access-Token, X-Application-Name, X-Request-Sent-Time");
-                    context.Response.AddHeader("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONAL");
-                    context.Response.AddHeader("Access-Control-Allow-Origin", "*");
+                    response.ContentType = "application/json";
 
-                    using var writer = new StreamWriter(context.Response.OutputStream);
-                    context.Response.ContentType = "application/json";
+                    using var writer = new StreamWriter(response.OutputStream);
                     await writer.WriteLineAsync(sendJson);
                 }
                 else
                 {
-                    Debug.LogWarningFormat("Handle api reqest path: '{0}' not found", context.Request.RawUrl);
-                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                    context.Response.Close();
+                    Debug.LogWarningFormat("Handle api reqest path: '{0}' not found", request.RawUrl);
+                    response.StatusCode = (int)HttpStatusCode.BadRequest;
+                    response.Close();
                 }
             }
             Debug.LogWarning("ServeAsync quit loop");

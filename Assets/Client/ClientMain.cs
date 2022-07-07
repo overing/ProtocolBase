@@ -109,22 +109,6 @@ public sealed class ProtocolClient
         return JsonUtility.FromJson<TResponse>(receiveJson);
     }
 
-#if UNITY_WEBGL
-    Task<string> JsonWebRequestAsync(string url, string json)
-    {
-        var request = UnityWebRequest.Post(url, json);
-        request.timeout = 3;
-        var taskSource = new TaskCompletionSource<string>();
-        request.SendWebRequest().completed += op =>
-        {
-            if (request.result == UnityWebRequest.Result.Success)
-                taskSource.SetResult(request.downloadHandler.text);
-            else
-                taskSource.SetException(new Exception($"{request.error} <- '{request.url}'"));
-        };
-        return taskSource.Task;
-    }
-#else
     async Task<string> JsonWebRequestAsync(string url, string json)
     {
         var request = UnityWebRequest.Post(url, json);
@@ -136,5 +120,4 @@ public sealed class ProtocolClient
             return request.downloadHandler.text;
         throw new Exception($"{request.error} <- '{request.url}'");
     }
-#endif
 }
