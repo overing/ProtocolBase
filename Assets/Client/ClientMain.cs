@@ -82,12 +82,13 @@ public sealed class ClientMain : MonoBehaviour
             });
             var endTicks = DateTime.UtcNow.Ticks;
             var M2CDelayTicks = endTicks - response.UtcTicks;
+            var totalDelay = TimeSpan.FromTicks(response.C2MDelayTicks) + TimeSpan.FromTicks(M2CDelayTicks);
             EnqueueMessage("Client receive M2C_Echo: {0}", new
             {
                 response.UtcTicks,
                 response.C2MDelayTicks,
                 M2CDelayTicks,
-                (TimeSpan.FromTicks(response.C2MDelayTicks) + TimeSpan.FromTicks(M2CDelayTicks)).TotalSeconds,
+                totalDelay.TotalSeconds,
             });
         }
         catch (Exception ex)
@@ -103,17 +104,17 @@ public sealed class ProtocolClient
         where TRequest : ProtocolRequest<TResponse>, new()
         where TResponse : ProtocolResponse, new()
     {
+        var url = apiBaseUrl + typeof(TRequest).Name;
         var sendJson = JsonUtility.ToJson(request);
-        var path = typeof(TRequest).Name;
-        var receiveJson = await JsonWebRequestAsync(apiBaseUrl + path, sendJson);
+        var receiveJson = await WebRequestPostAsync(url, sendJson);
         return JsonUtility.FromJson<TResponse>(receiveJson);
     }
 
-    async Task<string> JsonWebRequestAsync(string url, string json)
+    async Task<string> WebRequestPostAsync(string url, string data)
     {
-        var request = UnityWebRequest.Post(url, json);
+        var request = UnityWebRequest.Post(url, data);
         request.timeout = 3;
-        var operation = request.SendWebRequest();
+        request.SendWebRequest();
         while (request.result == UnityWebRequest.Result.InProgress)
             await Task.Yield();
         if (request.result == UnityWebRequest.Result.Success)

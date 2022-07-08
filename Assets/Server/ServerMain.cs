@@ -17,6 +17,7 @@ public sealed class ServerMain : MonoBehaviour
 
     ProtocolServer _server;
 
+    [Header("* 用 localhsot 會導致 UnityWebRequest 連不到")]
     [SerializeField]
     string _apiBaseUrl = "http://127.0.0.1:18763/pbapi/";
 
@@ -50,7 +51,7 @@ public sealed class ProtocolServer : IDisposable
     {
         _handlers = ProtocolCallbackUtility.BuildHandlers(target: this);
         _httpListener = new();
-        _httpListener.Prefixes.Add(apiBaseUrl); // 用 localhsot 會導致 UnityWebRequest 連不到
+        _httpListener.Prefixes.Add(apiBaseUrl);
         _allowOrigins = new HashSet<string>(allowOrigins);
     }
 
@@ -107,11 +108,11 @@ public sealed class ProtocolServer : IDisposable
                 {
                     using var reader = new StreamReader(request.InputStream);
                     var content = await reader.ReadToEndAsync();
+
                     var receiveJson = Uri.UnescapeDataString(content);
                     var sendJson = await handler(receiveJson, request.RemoteEndPoint);
 
                     response.ContentType = "application/json";
-
                     using var writer = new StreamWriter(response.OutputStream);
                     await writer.WriteLineAsync(sendJson);
                 }
