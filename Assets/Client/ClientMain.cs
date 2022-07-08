@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text;
 using System.Threading.Tasks;
 using UnityEngine;
 using UnityEngine.Networking;
@@ -58,7 +59,7 @@ public sealed class ClientMain : MonoBehaviour
         try
         {
             EnqueueMessage("Client send C2M_PlayerLogin");
-            var response = await _client.RequestAsync<C2M_PlayerLogin, M2C_PlayerLogin>(_apiBaseUrl, new()
+            var response = await _client.RequestAsync<C2M_PlayerLogin, M2C_PlayerLogin>(_apiBaseUrl, new C2M_PlayerLogin
             {
                 Account = "overing",
             });
@@ -76,7 +77,7 @@ public sealed class ClientMain : MonoBehaviour
         {
             EnqueueMessage("Client send C2M_Echo");
             var beginTicks = DateTime.UtcNow.Ticks;
-            var response = await _client.RequestAsync<C2M_Echo, M2C_Echo>(_apiBaseUrl, new()
+            var response = await _client.RequestAsync<C2M_Echo, M2C_Echo>(_apiBaseUrl, new C2M_Echo
             {
                 UtcTicks = beginTicks,
             });
@@ -106,19 +107,33 @@ public sealed class ProtocolClient
     {
         var url = apiBaseUrl + typeof(TRequest).Name;
         var sendJson = JsonUtility.ToJson(request);
-        var receiveJson = await WebRequestPostAsync(url, sendJson);
+        var receiveJson = await PostJsonWebRequestPostAsync(url, sendJson);
         return JsonUtility.FromJson<TResponse>(receiveJson);
     }
 
-    async Task<string> WebRequestPostAsync(string url, string data)
+    async Task<string> PostJsonWebRequestPostAsync(string url, string json)
     {
-        var request = UnityWebRequest.Post(url, data);
-        request.timeout = 3;
+        var bytes = Encoding.UTF8.GetBytes(json);
+        var request = new UnityWebRequest(url, UnityWebRequest.kHttpVerbPOST)
+        {
+            uploadHandler = new UploadHandlerRaw(bytes),
+            downloadHandler = new DownloadHandlerBuffer(),
+            timeout = 3,
+        };
+        if (url.StartsWith("https://", StringComparison.Ordinal))
+            request.certificateHandler = new AllowAll();
+        request.SetRequestHeader("Content-Type", "application/json");
+        request.SetRequestHeader("Accept", "application/json");
         request.SendWebRequest();
-        while (request.result == UnityWebRequest.Result.InProgress)
+        while (!request.isDone)
             await Task.Yield();
-        if (request.result == UnityWebRequest.Result.Success)
+        if (string.IsNullOrWhiteSpace(request.error))
             return request.downloadHandler.text;
         throw new Exception($"{request.error} <- '{request.url}'");
+    }
+
+    sealed class AllowAll : CertificateHandler
+    {
+        protected override bool ValidateCertificate(byte[] certificateData) => true;
     }
 }

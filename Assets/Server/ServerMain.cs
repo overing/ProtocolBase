@@ -11,7 +11,7 @@ using UnityEngine;
 public sealed class ServerMain : MonoBehaviour
 {
 #if !UNITY_WEBGL || UNITY_EDITOR
-    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterAssembliesLoaded)]
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
     static void AfterAssembliesLoaded() => DontDestroyOnLoad(new GameObject(nameof(ServerMain), typeof(ServerMain)));
 #endif
 
@@ -29,7 +29,7 @@ public sealed class ServerMain : MonoBehaviour
 
     void OnEnable()
     {
-        _server = new(_apiBaseUrl, _allowOrigins);
+        _server = new ProtocolServer(_apiBaseUrl, _allowOrigins);
         _server.Start();
     }
 
@@ -40,7 +40,7 @@ public sealed class ServerMain : MonoBehaviour
     }
 }
 
-public delegate ValueTask<string> JsonProtocolHandle(string json, IPEndPoint endPoint);
+public delegate Task<string> JsonProtocolHandle(string json, IPEndPoint endPoint);
 
 public sealed class ProtocolServer : IDisposable
 {
@@ -52,12 +52,12 @@ public sealed class ProtocolServer : IDisposable
     public ProtocolServer(string apiBaseUrl, IReadOnlyCollection<string> allowOrigins)
     {
         _jsonHandlers = ProtocolHandleFromJsonBuilder.BuildHandleMappings(target: this, methodName: nameof(HandleAsync));
-        _httpListener = new();
+        _httpListener = new HttpListener();
         _httpListener.Prefixes.Add(apiBaseUrl);
         _allowOrigins = new HashSet<string>(allowOrigins);
     }
 
-    public async ValueTask<M2C_PlayerLogin> HandleAsync(C2M_PlayerLogin request, IPEndPoint endPoint)
+    public async Task<M2C_PlayerLogin> HandleAsync(C2M_PlayerLogin request, IPEndPoint endPoint)
     {
         Debug.LogFormat("Sever receive C2M_PlayerLogin: {0} from {1}", new { request.Account }, endPoint);
         await Task.Yield();
@@ -69,14 +69,14 @@ public sealed class ProtocolServer : IDisposable
         };
     }
 
-    public ValueTask<M2C_Echo> HandleAsync(C2M_Echo request, IPEndPoint endPoint)
+    public Task<M2C_Echo> HandleAsync(C2M_Echo request, IPEndPoint endPoint)
     {
         Debug.LogFormat("Sever receive C2M_Echo: {0} from {1}", new { request.UtcTicks }, endPoint);
 
         var nowTicks = DateTime.UtcNow.Ticks;
 
         Debug.Log("Server send M2C_Echo");
-        return new ValueTask<M2C_Echo>(new M2C_Echo
+        return Task.FromResult(new M2C_Echo
         {
             C2MDelayTicks = nowTicks - request.UtcTicks,
             UtcTicks = nowTicks,
@@ -89,7 +89,7 @@ public sealed class ProtocolServer : IDisposable
         _ = ServeAsync();
     }
 
-    async ValueTask ServeAsync()
+    async Task ServeAsync()
     {
         Debug.LogFormat("Server start: {0}", string.Join(Environment.NewLine, _httpListener.Prefixes));
         Application.runInBackground = true;
@@ -105,18 +105,20 @@ public sealed class ProtocolServer : IDisposable
                 if (!string.IsNullOrWhiteSpace(origin) && _allowOrigins.Contains(origin))
                     response.AddHeader("Access-Control-Allow-Origin", origin);
 
-                var path = request.Url.LocalPath.Split("/").Last();
+                var path = request.Url.LocalPath.Split(new[] { '/' }).Last();
                 if (_jsonHandlers.TryGetValue(path, out var handler))
                 {
-                    using var reader = new StreamReader(request.InputStream);
-                    var content = await reader.ReadToEndAsync();
+                    using (var reader = new StreamReader(request.InputStream))
+                    {
+                        var content = await reader.ReadToEndAsync();
 
-                    var receiveJson = Uri.UnescapeDataString(content);
-                    var sendJson = await handler(receiveJson, request.RemoteEndPoint);
+                        var receiveJson = Uri.UnescapeDataString(content);
+                        var sendJson = await handler(receiveJson, request.RemoteEndPoint);
 
-                    response.ContentType = "application/json";
-                    using var writer = new StreamWriter(response.OutputStream);
-                    await writer.WriteLineAsync(sendJson);
+                        response.ContentType = "application/json";
+                        using (var writer = new StreamWriter(response.OutputStream))
+                            await writer.WriteLineAsync(sendJson);
+                    }
                 }
                 else
                 {
@@ -238,16 +240,16 @@ public static class ProtocolHandleFromJsonBuilder
                 var returnProtocolType = returnType.GenericTypeArguments[0];
                 if (!protocolBaseType.IsAssignableFrom(returnProtocolType))
                     return false;
-                var requireReturnType = typeof(ValueTask<>).MakeGenericType(returnProtocolType);
+                var requireReturnType = typeof(Task<>).MakeGenericType(returnProtocolType);
                 return returnType == requireReturnType;
             })
             .ToDictionary(m => m.GetParameters()[0].ParameterType);
     }
 
-    static async ValueTask<string> JsonHandleAsync<TRequest, TResponse>(
+    static async Task<string> JsonHandleAsync<TRequest, TResponse>(
         string requestJson,
         IPEndPoint endPoint,
-        Func<TRequest, IPEndPoint, ValueTask<TResponse>> protocolHandle)
+        Func<TRequest, IPEndPoint, Task<TResponse>> protocolHandle)
         where TRequest : ProtocolRequest<TResponse>, new()
         where TResponse : ProtocolResponse, new()
     {
