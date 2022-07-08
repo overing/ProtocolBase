@@ -17,7 +17,7 @@ public sealed class ServerMain : MonoBehaviour
 
     ProtocolServer _server;
 
-    [Header("* 用 localhsot 會導致 UnityWebRequest 連不到")]
+    [Header("* 用 localhsot 會導致 UnityWebRequest 連不到 *")]
     [SerializeField]
     string _apiBaseUrl = "http://127.0.0.1:18763/pbapi/";
 
@@ -40,22 +40,24 @@ public sealed class ServerMain : MonoBehaviour
     }
 }
 
+public delegate ValueTask<string> JsonProtocolHandle(string json, IPEndPoint endPoint);
+
 public sealed class ProtocolServer : IDisposable
 {
     HttpListener _httpListener;
-    Dictionary<string, Func<string, IPEndPoint, ValueTask<string>>> _handlers;
+    Dictionary<string, JsonProtocolHandle> _jsonHandlers;
     IReadOnlyCollection<string> _allowOrigins;
     bool _disposed;
 
     public ProtocolServer(string apiBaseUrl, IReadOnlyCollection<string> allowOrigins)
     {
-        _handlers = ProtocolCallbackUtility.BuildHandlers(target: this);
+        _jsonHandlers = ProtocolHandleFromJsonBuilder.BuildHandleMappings(target: this, methodName: nameof(HandleAsync));
         _httpListener = new();
         _httpListener.Prefixes.Add(apiBaseUrl);
         _allowOrigins = new HashSet<string>(allowOrigins);
     }
 
-    async ValueTask<M2C_PlayerLogin> Handle(C2M_PlayerLogin request, IPEndPoint endPoint)
+    public async ValueTask<M2C_PlayerLogin> HandleAsync(C2M_PlayerLogin request, IPEndPoint endPoint)
     {
         Debug.LogFormat("Sever receive C2M_PlayerLogin: {0} from {1}", new { request.Account }, endPoint);
         await Task.Yield();
@@ -67,7 +69,7 @@ public sealed class ProtocolServer : IDisposable
         };
     }
 
-    ValueTask<M2C_Echo> Handle(C2M_Echo request, IPEndPoint endPoint)
+    public ValueTask<M2C_Echo> HandleAsync(C2M_Echo request, IPEndPoint endPoint)
     {
         Debug.LogFormat("Sever receive C2M_Echo: {0} from {1}", new { request.UtcTicks }, endPoint);
 
@@ -104,7 +106,7 @@ public sealed class ProtocolServer : IDisposable
                     response.AddHeader("Access-Control-Allow-Origin", origin);
 
                 var path = request.Url.LocalPath.Split("/").Last();
-                if (_handlers.TryGetValue(path, out var handler))
+                if (_jsonHandlers.TryGetValue(path, out var handler))
                 {
                     using var reader = new StreamReader(request.InputStream);
                     var content = await reader.ReadToEndAsync();
@@ -141,7 +143,7 @@ public sealed class ProtocolServer : IDisposable
     {
         if (!_disposed)
         {
-            _handlers.Clear();
+            _jsonHandlers.Clear();
             _httpListener.Stop();
             _disposed = true;
         }
@@ -149,45 +151,25 @@ public sealed class ProtocolServer : IDisposable
     }
 }
 
-public static class ProtocolCallbackUtility
+public static class ProtocolHandleFromJsonBuilder
 {
-    public static Dictionary<string, Func<string, IPEndPoint, ValueTask<string>>> BuildHandlers(object target)
+    static readonly MethodInfo JsonHandleMethod;
+
+    static ProtocolHandleFromJsonBuilder()
     {
+        var methodName = nameof(JsonHandleAsync);
+        var flags = BindingFlags.Default;
+        flags |= BindingFlags.Static;
+        flags |= BindingFlags.NonPublic;
+        JsonHandleMethod = typeof(ProtocolHandleFromJsonBuilder).GetMethod(methodName, flags);
+    }
+
+    public static Dictionary<string, JsonProtocolHandle> BuildHandleMappings(object target, string methodName)
+    {
+        var handleMethods = GetProtocolHandleMethods(target, methodName);
+
         var protocolBaseType = typeof(ProtocolBase);
         var endPointType = typeof(IPEndPoint);
-
-        var handleMethodFlags = BindingFlags.Default;
-        handleMethodFlags |= BindingFlags.Instance;
-        handleMethodFlags |= BindingFlags.Public;
-        handleMethodFlags |= BindingFlags.NonPublic;
-        var handlerMethods = target.GetType().GetMethods(handleMethodFlags)
-            .Where(m =>
-            {
-                if (!m.Name.Equals("Handle", StringComparison.Ordinal))
-                    return false;
-                var parameters = m.GetParameters();
-                if (parameters.Length != 2)
-                    return false;
-                if (!protocolBaseType.IsAssignableFrom(parameters[0].ParameterType))
-                    return false;
-                if (!endPointType.IsAssignableFrom(parameters[1].ParameterType))
-                    return false;
-                var returnType = m.ReturnType;
-                if (!returnType.IsGenericType)
-                    return false;
-                var returnProtocolType = returnType.GenericTypeArguments[0];
-                if (!protocolBaseType.IsAssignableFrom(returnProtocolType))
-                    return false;
-                var requireReturnType = typeof(ValueTask<>).MakeGenericType(returnProtocolType);
-                return returnType == requireReturnType;
-            })
-            .ToDictionary(m => m.GetParameters()[0].ParameterType);
-
-        var parseMethodFlags = BindingFlags.Default;
-        parseMethodFlags |= BindingFlags.Static;
-        parseMethodFlags |= BindingFlags.NonPublic;
-        var parseMethod = typeof(ProtocolCallbackUtility).GetMethod(nameof(ParseTask), parseMethodFlags) ?? throw new MissingMethodException();
-
         return protocolBaseType.Assembly.GetTypes()
             .Where(t =>
             {
@@ -200,41 +182,77 @@ public static class ProtocolCallbackUtility
                 var baseType = t.BaseType;
                 if (!baseType.IsGenericType)
                     return false;
-                var gps = baseType.GetGenericArguments();
-                if (gps.Length != 1)
+                var genericArgs = baseType.GetGenericArguments();
+                if (genericArgs.Length != 1)
                     return false;
-                var responseType = gps[0];
+                var responseType = genericArgs[0];
                 if (typeof(ProtocolRequest<>).MakeGenericType(responseType) != baseType)
                     return false;
                 return true;
             })
-            .Where(protocolBaseType.IsAssignableFrom)
             .Where(t => !t.IsAbstract)
             .Where(t => t.GetConstructor(Type.EmptyTypes) != null)
-            .Where(handlerMethods.ContainsKey)
-            .ToDictionary(t => t.Name, t =>
+            .Where(handleMethods.ContainsKey)
+            .ToDictionary(t => t.Name, requestType =>
             {
-                var handleMethod = handlerMethods[t];
-                var responseType = t.BaseType.GetGenericArguments()[0];
-                var requestArg = Expression.Parameter(protocolBaseType);
-                var typedRequest = Expression.Convert(requestArg, t);
-                var endPointArg = Expression.Parameter(endPointType);
-                var callHandle = Expression.Call(Expression.Constant(target), handleMethod, typedRequest, endPointArg);
-                var typedParseTask = parseMethod.MakeGenericMethod(responseType);
-                var parseTask = Expression.Call(typedParseTask, callHandle);
-                var lambda = Expression.Lambda<Func<ProtocolBase, IPEndPoint, ValueTask<string>>>(parseTask, requestArg, endPointArg);
-                var @delegate = lambda.Compile();
-                return new Func<string, IPEndPoint, ValueTask<string>>(async (json, endPoint) =>
-                {
-                    var request = (ProtocolBase)JsonUtility.FromJson(json, t);
-                    return await @delegate(request, endPoint);
-                });
+                // emit a delegate like:
+                // (string json, IPEndPoint id) => JsonHandleAsync<C2M_A, M2C_A>(json, id, target.HandleAsync);
+                var responseType = requestType.BaseType.GetGenericArguments()[0];
+                var jsonArg = Expression.Parameter(typeof(string));
+                var endPointIdArg = Expression.Parameter(endPointType);
+                var protocolHandleMethod = handleMethods[requestType];
+                var responseTaskType = protocolHandleMethod.ReturnType;
+                var delegateType = Expression.GetFuncType(requestType, endPointType, responseTaskType);
+                var handleDelegate = Delegate.CreateDelegate(delegateType, target, protocolHandleMethod);
+                var delegateVar = Expression.Constant(handleDelegate);
+                var typedJsonHandleMethod = JsonHandleMethod.MakeGenericMethod(requestType, responseType);
+                var callJsonHandle = Expression.Call(typedJsonHandleMethod, jsonArg, endPointIdArg, delegateVar);
+                var lambda = Expression.Lambda<JsonProtocolHandle>(callJsonHandle, jsonArg, endPointIdArg);
+                return lambda.Compile();
             });
     }
 
-    static async ValueTask<string> ParseTask<TResponse>(ValueTask<TResponse> task) where TResponse : ProtocolResponse
+    static Dictionary<Type, MethodInfo> GetProtocolHandleMethods(object target, string methodName)
     {
-        var response = await task;
+        var protocolBaseType = typeof(ProtocolBase);
+        var endPointType = typeof(IPEndPoint);
+
+        var flags = BindingFlags.Default;
+        flags |= BindingFlags.Instance;
+        flags |= BindingFlags.Public;
+        return target.GetType().GetMethods(flags)
+            .Where(method =>
+            {
+                if (!method.Name.Equals(methodName, StringComparison.Ordinal))
+                    return false;
+                var parameters = method.GetParameters();
+                if (parameters.Length != 2)
+                    return false;
+                if (!protocolBaseType.IsAssignableFrom(parameters[0].ParameterType))
+                    return false;
+                if (!endPointType.IsAssignableFrom(parameters[1].ParameterType))
+                    return false;
+                var returnType = method.ReturnType;
+                if (!returnType.IsGenericType)
+                    return false;
+                var returnProtocolType = returnType.GenericTypeArguments[0];
+                if (!protocolBaseType.IsAssignableFrom(returnProtocolType))
+                    return false;
+                var requireReturnType = typeof(ValueTask<>).MakeGenericType(returnProtocolType);
+                return returnType == requireReturnType;
+            })
+            .ToDictionary(m => m.GetParameters()[0].ParameterType);
+    }
+
+    static async ValueTask<string> JsonHandleAsync<TRequest, TResponse>(
+        string requestJson,
+        IPEndPoint endPoint,
+        Func<TRequest, IPEndPoint, ValueTask<TResponse>> protocolHandle)
+        where TRequest : ProtocolRequest<TResponse>, new()
+        where TResponse : ProtocolResponse, new()
+    {
+        var request = JsonUtility.FromJson<TRequest>(requestJson);
+        var response = await protocolHandle(request, endPoint);
         return JsonUtility.ToJson(response);
     }
 }
